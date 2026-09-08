@@ -1,0 +1,17 @@
+# syntax=docker/dockerfile:1
+
+# Build each target platform's monitor binary, then retain every runtime artifact
+# from the deployed HAMi image except that binary.
+ARG GOLANG_IMAGE=golang:1.26.2-bookworm
+FROM --platform=$TARGETPLATFORM ${GOLANG_IMAGE} AS build
+
+WORKDIR /k8s-vgpu
+ADD . .
+ARG VERSION=v2.9.0
+RUN go env -w GO111MODULE=on
+RUN mkdir -p /k8s-vgpu/bin && make vGPUmonitor VERSION="${VERSION}"
+
+# This is the currently deployed, multi-architecture HAMi image. Do not replace
+# it with an upstream HAMi core image: it contains the patched runtime core.
+FROM --platform=$TARGETPLATFORM harbor.dev.superb-ai.com/onprem-app/hami@sha256:d31a4ba197125ea877169c5913705647f9bc3d1ba9e3f99bc37412920f88abb5
+COPY --from=build /k8s-vgpu/bin/vGPUmonitor /k8s-vgpu/bin/vGPUmonitor

@@ -91,6 +91,24 @@ var (
 		[]string{"device_index", "device_uuid", "device_type"}, nil,
 	)
 
+	hostGPUReservedMemoryDesc = prometheus.NewDesc(
+		"hami_host_gpu_memory_reserved_bytes",
+		"GPU device memory reserved for system use in bytes, as reported by NVML v2",
+		[]string{"device_index", "device_uuid", "device_type"}, nil,
+	)
+
+	hostGPUAllocatedMemoryDesc = prometheus.NewDesc(
+		"hami_host_gpu_memory_allocated_bytes",
+		"GPU device memory allocated in bytes, excluding NVML v2 system-reserved memory",
+		[]string{"device_index", "device_uuid", "device_type"}, nil,
+	)
+
+	hostGPUMemoryAccountingModeDesc = prometheus.NewDesc(
+		"hami_host_gpu_memory_accounting_mode_info",
+		"GPU memory accounting mode; value is always 1 for the current bounded mode",
+		[]string{"device_index", "device_uuid", "device_type", "memory_accounting_mode"}, nil,
+	)
+
 	hostGPUUtilizationdesc = prometheus.NewDesc(
 		"hami_host_gpu_utilization_ratio",
 		"GPU core utilization ratio (0-100)",
@@ -146,6 +164,8 @@ var (
 		[]string{"namespace", "pod", "container", "vdevice_index", "device_uuid"}, nil,
 	)
 )
+
+var deviceGetHandleByIndex = nvml.DeviceGetHandleByIndex
 
 // Legacy metric descriptors (populated only when --legacy-metrics is enabled).
 var (
@@ -216,6 +236,9 @@ func sendLegacyMetric(ch chan<- prometheus.Metric, desc *prometheus.Desc, valueT
 // descriptors.
 func (cc ClusterManagerCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- hostGPUdesc
+	ch <- hostGPUReservedMemoryDesc
+	ch <- hostGPUAllocatedMemoryDesc
+	ch <- hostGPUMemoryAccountingModeDesc
 	ch <- ctrvGPUdesc
 	ch <- ctrvGPUlimitdesc
 	ch <- hostGPUUtilizationdesc
@@ -234,6 +257,40 @@ func (cc ClusterManagerCollector) Describe(ch chan<- *prometheus.Desc) {
 		ch <- legacyCtrDeviceUtilizationdesc
 		ch <- legacyCtrDeviceLastKernelDesc
 		ch <- legacyCtrDeviceMigInfo
+	}
+}
+
+type gpuMemoryAccountingMode string
+
+const (
+	gpuMemoryAccountingModeV2Split    gpuMemoryAccountingMode = "v2_split"
+	gpuMemoryAccountingModeV1Combined gpuMemoryAccountingMode = "v1_combined"
+	gpuMemoryAccountingModeUnknown    gpuMemoryAccountingMode = "unknown"
+)
+
+type gpuMemoryAccounting struct {
+	mode      gpuMemoryAccountingMode
+	allocated uint64
+	reserved  uint64
+	hasSplit  bool
+}
+
+func classifyGPUMemoryAccounting(memory nvml.Memory_v2, ret nvml.Return) (gpuMemoryAccounting, error) {
+	switch ret {
+	case nvml.SUCCESS:
+		if memory.Used < memory.Reserved {
+			return gpuMemoryAccounting{mode: gpuMemoryAccountingModeUnknown}, fmt.Errorf("nvml v2 memory used is less than reserved")
+		}
+		return gpuMemoryAccounting{
+			mode:      gpuMemoryAccountingModeV2Split,
+			allocated: memory.Used - memory.Reserved,
+			reserved:  memory.Reserved,
+			hasSplit:  true,
+		}, nil
+	case nvml.ERROR_NOT_SUPPORTED, nvml.ERROR_FUNCTION_NOT_FOUND:
+		return gpuMemoryAccounting{mode: gpuMemoryAccountingModeV1Combined}, nil
+	default:
+		return gpuMemoryAccounting{mode: gpuMemoryAccountingModeUnknown}, fmt.Errorf("nvml get memory v2 error ret=%d", ret)
 	}
 }
 
@@ -344,7 +401,7 @@ func (cc ClusterManagerCollector) getDeviceCount() (int, error) {
 }
 
 func (cc ClusterManagerCollector) collectGPUDeviceMetrics(ch chan<- prometheus.Metric, index int) error {
-	hdev, nvret := nvml.DeviceGetHandleByIndex(index)
+	hdev, nvret := deviceGetHandleByIndex(index)
 	if nvret != nvml.SUCCESS {
 		return fmt.Errorf("nvml DeviceGetHandleByIndex err: %s", nvml.ErrorString(nvret))
 	}
@@ -381,17 +438,53 @@ func (cc ClusterManagerCollector) collectGPUMemoryMetrics(ch chan<- prometheus.M
 	}
 
 	deviceName = "NVIDIA-" + deviceName
+	labels := []string{fmt.Sprint(index), uuid, deviceName}
+
+	v2Memory, v2Ret := hdev.GetMemoryInfo_v2()
+	accounting, accountingErr := classifyGPUMemoryAccounting(v2Memory, v2Ret)
+	combinedUsed := memory.Used
+	if accounting.hasSplit {
+		// Use the v2 snapshot for all host-memory values so combined, reserved, and
+		// allocated measurements are internally consistent for this scrape.
+		combinedUsed = v2Memory.Used
+	}
 
 	ch <- prometheus.MustNewConstMetric(
 		hostGPUdesc,
 		prometheus.GaugeValue,
-		float64(memory.Used),
-		fmt.Sprint(index), uuid, deviceName,
+		float64(combinedUsed),
+		labels...,
 	)
 
-	sendLegacyMetric(ch, legacyHostGPUdesc, prometheus.GaugeValue, float64(memory.Used),
-		fmt.Sprint(index), uuid, deviceName,
+	sendLegacyMetric(ch, legacyHostGPUdesc, prometheus.GaugeValue, float64(combinedUsed),
+		labels...,
 	)
+
+	ch <- prometheus.MustNewConstMetric(
+		hostGPUMemoryAccountingModeDesc,
+		prometheus.GaugeValue,
+		1,
+		append(labels, string(accounting.mode))...,
+	)
+
+	if accounting.hasSplit {
+		ch <- prometheus.MustNewConstMetric(
+			hostGPUReservedMemoryDesc,
+			prometheus.GaugeValue,
+			float64(accounting.reserved),
+			labels...,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			hostGPUAllocatedMemoryDesc,
+			prometheus.GaugeValue,
+			float64(accounting.allocated),
+			labels...,
+		)
+	}
+
+	if accountingErr != nil {
+		klog.V(3).Infof("NVML v2 memory accounting unavailable for device %d; using v1 combined memory metric: %v", index, accountingErr)
+	}
 
 	return nil
 }

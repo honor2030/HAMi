@@ -147,7 +147,21 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{- define "hami.devicePlugin.monitor.image" -}}
+{{- $imageRoot := .Values.devicePlugin.monitor.image -}}
+{{- $digest := $imageRoot.digest | default "" | toString | trim -}}
+{{- if $digest -}}
+{{- $registryName := $imageRoot.registry -}}
+{{- if and .Values.global .Values.global.imageRegistry -}}
+{{- $registryName = .Values.global.imageRegistry -}}
+{{- end -}}
+{{- if $registryName -}}
+{{- printf "%s/%s@%s" $registryName $imageRoot.repository $digest -}}
+{{- else -}}
+{{- printf "%s@%s" $imageRoot.repository $digest -}}
+{{- end -}}
+{{- else -}}
 {{ include "hami.image" (dict "imageRoot" .Values.devicePlugin.monitor.image "global" .Values.global) }}
+{{- end -}}
 {{- end -}}
 
 {{- define "hami.scheduler.patch.image" -}}

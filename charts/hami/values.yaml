@@ -294,12 +294,14 @@ devicePlugin:
     ## @param image.registry monitor image registry
     ## @param image.repository monitor image repository
     ## @param image.tag monitor image tag (immutable tags are recommended)
+    ## @param image.digest monitor image digest (optional; overrides tag when set)
     ## @param image.pullPolicy monitor image pull policy
     ## @param image.pullSecrets Specify docker-registry secret names as an array
     image:
       registry: "docker.io"
       repository: "projecthami/hami"
       tag: ""
+      digest: ""
       ## Specify a imagePullPolicy
       ## Defaults to 'Always' if image tag is 'latest', else set to 'IfNotPresent'
       ## ref: https://kubernetes.io/docs/user-guide/images/#pre-pulling-images

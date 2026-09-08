@@ -8,8 +8,9 @@ FROM --platform=$TARGETPLATFORM ${GOLANG_IMAGE} AS build
 WORKDIR /k8s-vgpu
 ADD . .
 ARG VERSION=v2.9.0
+ARG GITHUB_SHA=unknown
 RUN go env -w GO111MODULE=on
-RUN mkdir -p /k8s-vgpu/bin && make vGPUmonitor VERSION="${VERSION}"
+RUN mkdir -p /k8s-vgpu/bin && GITHUB_SHA="${GITHUB_SHA}" make vGPUmonitor VERSION="${VERSION}"
 
 # This is the currently deployed, multi-architecture HAMi image. Do not replace
 # it with an upstream HAMi core image: it contains the patched runtime core.

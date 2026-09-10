@@ -32,6 +32,7 @@ const (
 	testHostGPUReservedMetric    = "hami_host_gpu_memory_reserved_bytes"
 	testHostGPUAllocatedMetric   = "hami_host_gpu_memory_allocated_bytes"
 	testHostGPUModeMetric        = "hami_host_gpu_memory_accounting_mode_info"
+	testHostGPUV2AnomalyMetric   = "hami_host_gpu_memory_v2_anomaly"
 	testHostGPUUtilizationMetric = "hami_host_gpu_utilization_ratio"
 )
 
@@ -56,6 +57,8 @@ func TestCollectGPUMemoryMetricsUsesOneV2SnapshotForCombinedAndSplit(t *testing.
 	assertMetricValue(t, metrics, testHostGPUReservedMetric, 32)
 	assertMetricValue(t, metrics, testHostGPUAllocatedMetric, 128)
 	assertMetricMode(t, metrics, gpuMemoryAccountingModeV2Split)
+	// A genuine v2 split is not an anomaly.
+	assertMetricValue(t, metrics, testHostGPUV2AnomalyMetric, 0)
 	assertSharedDeviceLabels(t, metrics)
 }
 
@@ -69,21 +72,29 @@ func TestCollectGPUMemoryMetricsUsesV1CombinedFallbackWithoutSplit(t *testing.T)
 
 			assertMetricValue(t, metrics, testHostGPUUsedMetric, 128)
 			assertMetricMode(t, metrics, gpuMemoryAccountingModeV1Combined)
+			// v2 simply does not exist on such a host; that is not an anomaly.
+			assertMetricValue(t, metrics, testHostGPUV2AnomalyMetric, 0)
 			assertMetricAbsent(t, metrics, testHostGPUReservedMetric)
 			assertMetricAbsent(t, metrics, testHostGPUAllocatedMetric)
 		})
 	}
 }
 
-func TestCollectGPUMemoryMetricsReportsUnknownWithoutFabricatedSplit(t *testing.T) {
+// TestCollectGPUMemoryMetricsLabelsUnusableV2AsV1Combined covers the cases where the v2
+// query cannot produce a trustworthy split. The value served is the v1 combined reading,
+// so the mode label must say v1_combined rather than unknown; the anomaly gauge, not the
+// mode label, carries the "this driver's v2 path is misbehaving" signal.
+func TestCollectGPUMemoryMetricsLabelsUnusableV2AsV1Combined(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		ret    nvml.Return
-		memory nvml.Memory_v2
+		name        string
+		ret         nvml.Return
+		memory      nvml.Memory_v2
+		wantAnomaly float64
 	}{
 		{
-			name: "v2 error",
-			ret:  nvml.ERROR_UNKNOWN,
+			name:        "v2 error",
+			ret:         nvml.ERROR_UNKNOWN,
+			wantAnomaly: 0,
 		},
 		{
 			name: "reserved exceeds used",
@@ -92,6 +103,7 @@ func TestCollectGPUMemoryMetricsReportsUnknownWithoutFabricatedSplit(t *testing.
 				Used:     31,
 				Reserved: 32,
 			},
+			wantAnomaly: 1,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -101,14 +113,57 @@ func TestCollectGPUMemoryMetricsReportsUnknownWithoutFabricatedSplit(t *testing.
 			}
 
 			assertMetricValue(t, metrics, testHostGPUUsedMetric, 128)
-			assertMetricMode(t, metrics, gpuMemoryAccountingModeUnknown)
+			assertMetricMode(t, metrics, gpuMemoryAccountingModeV1Combined)
+			assertMetricValue(t, metrics, testHostGPUV2AnomalyMetric, tc.wantAnomaly)
+			// No split is fabricated from an untrustworthy v2 snapshot.
 			assertMetricAbsent(t, metrics, testHostGPUReservedMetric)
 			assertMetricAbsent(t, metrics, testHostGPUAllocatedMetric)
 		})
 	}
 }
 
-func TestCollectGPUDeviceMetricsContinuesUtilizationWhenV2AccountingIsUnknown(t *testing.T) {
+// TestClassifyGPUMemoryAccountingReportsUnknownWithoutAnySource pins the one remaining
+// use of the unknown mode: neither v1 nor v2 produced a value. collectGPUMemoryMetrics
+// returns early when the v1 call fails, so this state is only reachable at the
+// classifier boundary.
+func TestClassifyGPUMemoryAccountingReportsUnknownWithoutAnySource(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		ret         nvml.Return
+		memory      nvml.Memory_v2
+		wantAnomaly bool
+	}{
+		{
+			name: "v2 not supported",
+			ret:  nvml.ERROR_NOT_SUPPORTED,
+		},
+		{
+			name: "v2 error",
+			ret:  nvml.ERROR_UNKNOWN,
+		},
+		{
+			name:        "reserved exceeds used",
+			ret:         nvml.SUCCESS,
+			memory:      nvml.Memory_v2{Used: 31, Reserved: 32},
+			wantAnomaly: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			accounting, _ := classifyGPUMemoryAccounting(tc.memory, tc.ret, false)
+			if accounting.mode != gpuMemoryAccountingModeUnknown {
+				t.Errorf("mode = %q, want %q", accounting.mode, gpuMemoryAccountingModeUnknown)
+			}
+			if accounting.hasSplit {
+				t.Error("hasSplit = true, want false")
+			}
+			if accounting.v2Anomaly != tc.wantAnomaly {
+				t.Errorf("v2Anomaly = %v, want %v", accounting.v2Anomaly, tc.wantAnomaly)
+			}
+		})
+	}
+}
+
+func TestCollectGPUDeviceMetricsContinuesUtilizationWhenV2AccountingIsUnusable(t *testing.T) {
 	device := testNVMLDevice(128, nvml.ERROR_UNKNOWN, nvml.Memory_v2{})
 	originalDeviceGetHandleByIndex := deviceGetHandleByIndex
 	deviceGetHandleByIndex = func(int) (nvml.Device, nvml.Return) {
@@ -118,7 +173,7 @@ func TestCollectGPUDeviceMetricsContinuesUtilizationWhenV2AccountingIsUnknown(t 
 		deviceGetHandleByIndex = originalDeviceGetHandleByIndex
 	})
 
-	ch := make(chan prometheus.Metric, 5)
+	ch := make(chan prometheus.Metric, 8)
 	err := (ClusterManagerCollector{}).collectGPUDeviceMetrics(ch, 0)
 	close(ch)
 	if err != nil {
@@ -127,7 +182,8 @@ func TestCollectGPUDeviceMetricsContinuesUtilizationWhenV2AccountingIsUnknown(t 
 
 	metrics := captureMetricsForTest(t, ch)
 	assertMetricValue(t, metrics, testHostGPUUsedMetric, 128)
-	assertMetricMode(t, metrics, gpuMemoryAccountingModeUnknown)
+	assertMetricMode(t, metrics, gpuMemoryAccountingModeV1Combined)
+	assertMetricValue(t, metrics, testHostGPUV2AnomalyMetric, 0)
 	assertMetricAbsent(t, metrics, testHostGPUReservedMetric)
 	assertMetricAbsent(t, metrics, testHostGPUAllocatedMetric)
 	assertMetricValue(t, metrics, testHostGPUUtilizationMetric, 42)
@@ -160,7 +216,7 @@ func TestCollectGPUDeviceMetricsPreservesV1MemoryErrorPath(t *testing.T) {
 
 func collectGPUMemoryMetricsForTest(t *testing.T, v1Used uint64, v2Ret nvml.Return, v2Memory nvml.Memory_v2) (map[string]capturedMemoryMetric, error) {
 	t.Helper()
-	ch := make(chan prometheus.Metric, 4)
+	ch := make(chan prometheus.Metric, 8)
 	err := (ClusterManagerCollector{}).collectGPUMemoryMetrics(ch, testNVMLDevice(v1Used, v2Ret, v2Memory), 0)
 	close(ch)
 	return captureMetricsForTest(t, ch), err
@@ -220,6 +276,7 @@ func hostGPUMemoryMetricName(t *testing.T, metric prometheus.Metric) string {
 		testHostGPUReservedMetric,
 		testHostGPUAllocatedMetric,
 		testHostGPUModeMetric,
+		testHostGPUV2AnomalyMetric,
 		testHostGPUUtilizationMetric,
 	} {
 		if strings.Contains(desc, `fqName: "`+name+`"`) {
@@ -260,15 +317,19 @@ func assertMetricAbsent(t *testing.T, metrics map[string]capturedMemoryMetric, n
 func assertMetricMode(t *testing.T, metrics map[string]capturedMemoryMetric, want gpuMemoryAccountingMode) {
 	t.Helper()
 	assertMetricValue(t, metrics, testHostGPUModeMetric, 1)
-	if got := findMetric(t, metrics, testHostGPUModeMetric).labels["memory_accounting_mode"]; got != string(want) {
-		t.Errorf("memory accounting mode = %q, want %q", got, want)
+	// The anomaly gauge is labelled exactly like the mode-info metric, so both must
+	// agree on the mode.
+	for _, name := range []string{testHostGPUModeMetric, testHostGPUV2AnomalyMetric} {
+		if got := findMetric(t, metrics, name).labels["memory_accounting_mode"]; got != string(want) {
+			t.Errorf("metric %q memory accounting mode = %q, want %q", name, got, want)
+		}
 	}
 }
 
 func assertSharedDeviceLabels(t *testing.T, metrics map[string]capturedMemoryMetric) {
 	t.Helper()
 	used := findMetric(t, metrics, testHostGPUUsedMetric).labels
-	for _, name := range []string{testHostGPUReservedMetric, testHostGPUAllocatedMetric, testHostGPUModeMetric} {
+	for _, name := range []string{testHostGPUReservedMetric, testHostGPUAllocatedMetric, testHostGPUModeMetric, testHostGPUV2AnomalyMetric} {
 		for _, labelName := range []string{"device_index", "device_uuid", "device_type"} {
 			if got := findMetric(t, metrics, name).labels[labelName]; got != used[labelName] {
 				t.Errorf("metric %q label %q = %q, want %q", name, labelName, got, used[labelName])

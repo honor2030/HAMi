@@ -281,9 +281,9 @@ type gpuMemoryAccounting struct {
 	reserved  uint64
 	hasSplit  bool
 	// v2Anomaly records that the NVML v2 query returned nvml.SUCCESS but with an
-	// internally contradictory pair (used < reserved). The mode label then collapses
-	// to v1_combined because that is the value actually served, so this flag is the
-	// only place the data-quality signal survives.
+	// internally contradictory triple (used + reserved > total). The mode label then
+	// collapses to v1_combined because that is the value actually served, so this flag
+	// is the only place the data-quality signal survives.
 	v2Anomaly bool
 }
 
@@ -296,10 +296,17 @@ type gpuMemoryAccounting struct {
 // rather than unknown. unknown is reserved for the case where neither v1 nor v2
 // produced a value.
 //
-// A v2 call that succeeds but reports used < reserved is unusable for a split, yet it
-// is a distinct condition from "v2 does not exist on this host": it means this driver's
-// v2 path is misbehaving. That signal is preserved in v2Anomaly (exported as
-// hami_host_gpu_memory_v2_anomaly) and in the returned error, which the caller logs.
+// NVML v2 memory accounting satisfies Total = Free + Used + Reserved, so v2 Used holds
+// the process allocation *excluding* the driver reservation, and v1 Used (Total - Free)
+// equals v2 Used + v2 Reserved. allocated is therefore v2 Used verbatim, and the combined
+// gauge keeps v1 semantics by adding the reservation back (see collectGPUMemoryMetrics).
+// Used < Reserved is the ordinary state of an idle card and is not an anomaly.
+//
+// A v2 call that succeeds but reports used + reserved > total contradicts that identity
+// and is unusable for a split, yet it is a distinct condition from "v2 does not exist on
+// this host": it means this driver's v2 path is misbehaving. That signal is preserved in
+// v2Anomaly (exported as hami_host_gpu_memory_v2_anomaly) and in the returned error,
+// which the caller logs.
 func classifyGPUMemoryAccounting(memory nvml.Memory_v2, ret nvml.Return, v1Available bool) (gpuMemoryAccounting, error) {
 	// fallback builds the no-split result: v1_combined when a v1 value is being
 	// served, unknown when there is no value from either source.
@@ -313,12 +320,14 @@ func classifyGPUMemoryAccounting(memory nvml.Memory_v2, ret nvml.Return, v1Avail
 
 	switch ret {
 	case nvml.SUCCESS:
-		if memory.Used < memory.Reserved {
-			return fallback(true, fmt.Errorf("nvml v2 memory used is less than reserved"))
+		// Sanity check against the NVML v2 identity Total = Free + Used + Reserved.
+		// Anything that breaks it cannot be split into allocated/reserved parts.
+		if memory.Used+memory.Reserved > memory.Total {
+			return fallback(true, fmt.Errorf("nvml v2 memory used+reserved exceeds total"))
 		}
 		return gpuMemoryAccounting{
 			mode:      gpuMemoryAccountingModeV2Split,
-			allocated: memory.Used - memory.Reserved,
+			allocated: memory.Used,
 			reserved:  memory.Reserved,
 			hasSplit:  true,
 		}, nil
@@ -483,8 +492,11 @@ func (cc ClusterManagerCollector) collectGPUMemoryMetrics(ch chan<- prometheus.M
 	combinedUsed := memory.Used
 	if accounting.hasSplit {
 		// Use the v2 snapshot for all host-memory values so combined, reserved, and
-		// allocated measurements are internally consistent for this scrape.
-		combinedUsed = v2Memory.Used
+		// allocated measurements are internally consistent for this scrape. v2 Used
+		// excludes the driver reservation (Total = Free + Used + Reserved), so the
+		// reservation is added back to keep the combined gauge on the single v1
+		// definition regardless of the accounting mode.
+		combinedUsed = v2Memory.Used + v2Memory.Reserved
 	}
 
 	ch <- prometheus.MustNewConstMetric(

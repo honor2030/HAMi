@@ -36,30 +36,96 @@ const (
 	testHostGPUUtilizationMetric = "hami_host_gpu_utilization_ratio"
 )
 
+// Byte values modelled on the GPU5 TITAN RTX cards, where the NVML v2 identity
+// Total = Free + Used + Reserved was confirmed against nvidia-smi.
+const (
+	testGPUTotalBytes        = 24576 * 1024 * 1024 // 24 GiB
+	testDriverReservedBytes  = 554 * 1024 * 1024   // driver reservation, ~0.5413 GiB
+	testIdleAllocatedBytes   = 9 * 1024 * 1024     // idle card process allocation
+	testLoadedAllocatedBytes = 8 * 1024 * 1024 * 1024
+	testIdleCombinedBytes    = testIdleAllocatedBytes + testDriverReservedBytes   // 563 MiB
+	testLoadedCombinedBytes  = testLoadedAllocatedBytes + testDriverReservedBytes // 8.54 GiB
+)
+
 type capturedMemoryMetric struct {
 	name   string
 	value  float64
 	labels map[string]string
 }
 
+// TestCollectGPUMemoryMetricsUsesOneV2SnapshotForCombinedAndSplit pins the NVML v2
+// semantics Total = Free + Used + Reserved. v2 Used is the process allocation and
+// EXCLUDES the driver reservation, so allocated is v2 Used verbatim and the combined
+// gauge adds the reservation back to keep one definition (the v1 one) across modes.
 func TestCollectGPUMemoryMetricsUsesOneV2SnapshotForCombinedAndSplit(t *testing.T) {
-	metrics, err := collectGPUMemoryMetricsForTest(t, 128, nvml.SUCCESS, nvml.Memory_v2{
-		Used:     160,
-		Reserved: 32,
-	})
-	if err != nil {
-		t.Fatalf("collectGPUMemoryMetrics() error = %v", err)
-	}
+	for _, tc := range []struct {
+		name         string
+		used         uint64
+		wantCombined float64
+	}{
+		{
+			// The idle state that used to trip the old used < reserved guard on
+			// every scrape: 9 MiB allocated, 554 MiB reserved, 563 MiB combined.
+			name:         "idle card allocates less than the driver reservation",
+			used:         testIdleAllocatedBytes,
+			wantCombined: testIdleCombinedBytes,
+		},
+		{
+			name:         "loaded card allocates more than the driver reservation",
+			used:         testLoadedAllocatedBytes,
+			wantCombined: testLoadedCombinedBytes,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The v1 value deliberately differs from v2. A v2 split must keep the
+			// compatible combined value on the same v2 snapshot as reserved/allocated.
+			metrics, err := collectGPUMemoryMetricsForTest(t, 128, nvml.SUCCESS, nvml.Memory_v2{
+				Total:    testGPUTotalBytes,
+				Used:     tc.used,
+				Reserved: testDriverReservedBytes,
+			})
+			if err != nil {
+				t.Fatalf("collectGPUMemoryMetrics() error = %v", err)
+			}
 
-	// The v1 value deliberately differs from v2. A v2 split must keep the
-	// compatible combined value on the same v2 snapshot as reserved/allocated.
-	assertMetricValue(t, metrics, testHostGPUUsedMetric, 160)
-	assertMetricValue(t, metrics, testHostGPUReservedMetric, 32)
-	assertMetricValue(t, metrics, testHostGPUAllocatedMetric, 128)
-	assertMetricMode(t, metrics, gpuMemoryAccountingModeV2Split)
-	// A genuine v2 split is not an anomaly.
-	assertMetricValue(t, metrics, testHostGPUV2AnomalyMetric, 0)
-	assertSharedDeviceLabels(t, metrics)
+			assertMetricValue(t, metrics, testHostGPUUsedMetric, tc.wantCombined)
+			assertMetricValue(t, metrics, testHostGPUReservedMetric, testDriverReservedBytes)
+			assertMetricValue(t, metrics, testHostGPUAllocatedMetric, float64(tc.used))
+			assertMetricMode(t, metrics, gpuMemoryAccountingModeV2Split)
+			// A genuine v2 split is not an anomaly.
+			assertMetricValue(t, metrics, testHostGPUV2AnomalyMetric, 0)
+			assertSharedDeviceLabels(t, metrics)
+		})
+	}
+}
+
+// TestClassifyGPUMemoryAccountingAcceptsUsedBelowReserved is the direct regression test
+// for the accounting-mode oscillation: an idle card reports v2 Used below Reserved on
+// every scrape, and that must classify as a stable v2_split rather than an anomaly.
+func TestClassifyGPUMemoryAccountingAcceptsUsedBelowReserved(t *testing.T) {
+	accounting, err := classifyGPUMemoryAccounting(nvml.Memory_v2{
+		Total:    testGPUTotalBytes,
+		Used:     testIdleAllocatedBytes,
+		Reserved: testDriverReservedBytes,
+	}, nvml.SUCCESS, true)
+	if err != nil {
+		t.Fatalf("classifyGPUMemoryAccounting() error = %v", err)
+	}
+	if accounting.mode != gpuMemoryAccountingModeV2Split {
+		t.Errorf("mode = %q, want %q", accounting.mode, gpuMemoryAccountingModeV2Split)
+	}
+	if !accounting.hasSplit {
+		t.Error("hasSplit = false, want true")
+	}
+	if accounting.v2Anomaly {
+		t.Error("v2Anomaly = true, want false")
+	}
+	if accounting.allocated != testIdleAllocatedBytes {
+		t.Errorf("allocated = %d, want %d", accounting.allocated, uint64(testIdleAllocatedBytes))
+	}
+	if accounting.reserved != testDriverReservedBytes {
+		t.Errorf("reserved = %d, want %d", accounting.reserved, uint64(testDriverReservedBytes))
+	}
 }
 
 func TestCollectGPUMemoryMetricsUsesV1CombinedFallbackWithoutSplit(t *testing.T) {
@@ -97,11 +163,13 @@ func TestCollectGPUMemoryMetricsLabelsUnusableV2AsV1Combined(t *testing.T) {
 			wantAnomaly: 0,
 		},
 		{
-			name: "reserved exceeds used",
+			// Breaks Total = Free + Used + Reserved, so no split can be derived.
+			name: "used plus reserved exceeds total",
 			ret:  nvml.SUCCESS,
 			memory: nvml.Memory_v2{
-				Used:     31,
-				Reserved: 32,
+				Total:    testGPUTotalBytes,
+				Used:     testGPUTotalBytes,
+				Reserved: testDriverReservedBytes,
 			},
 			wantAnomaly: 1,
 		},
@@ -142,9 +210,9 @@ func TestClassifyGPUMemoryAccountingReportsUnknownWithoutAnySource(t *testing.T)
 			ret:  nvml.ERROR_UNKNOWN,
 		},
 		{
-			name:        "reserved exceeds used",
+			name:        "used plus reserved exceeds total",
 			ret:         nvml.SUCCESS,
-			memory:      nvml.Memory_v2{Used: 31, Reserved: 32},
+			memory:      nvml.Memory_v2{Total: testGPUTotalBytes, Used: testGPUTotalBytes, Reserved: testDriverReservedBytes},
 			wantAnomaly: true,
 		},
 	} {

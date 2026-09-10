@@ -109,6 +109,12 @@ var (
 		[]string{"device_index", "device_uuid", "device_type", "memory_accounting_mode"}, nil,
 	)
 
+	hostGPUMemoryV2AnomalyDesc = prometheus.NewDesc(
+		"hami_host_gpu_memory_v2_anomaly",
+		"1 when the NVML v2 memory query succeeded but returned internally inconsistent data (used < reserved), 0 otherwise",
+		[]string{"device_index", "device_uuid", "device_type", "memory_accounting_mode"}, nil,
+	)
+
 	hostGPUUtilizationdesc = prometheus.NewDesc(
 		"hami_host_gpu_utilization_ratio",
 		"GPU core utilization ratio (0-100)",
@@ -239,6 +245,7 @@ func (cc ClusterManagerCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- hostGPUReservedMemoryDesc
 	ch <- hostGPUAllocatedMemoryDesc
 	ch <- hostGPUMemoryAccountingModeDesc
+	ch <- hostGPUMemoryV2AnomalyDesc
 	ch <- ctrvGPUdesc
 	ch <- ctrvGPUlimitdesc
 	ch <- hostGPUUtilizationdesc
@@ -273,13 +280,41 @@ type gpuMemoryAccounting struct {
 	allocated uint64
 	reserved  uint64
 	hasSplit  bool
+	// v2Anomaly records that the NVML v2 query returned nvml.SUCCESS but with an
+	// internally contradictory pair (used < reserved). The mode label then collapses
+	// to v1_combined because that is the value actually served, so this flag is the
+	// only place the data-quality signal survives.
+	v2Anomaly bool
 }
 
-func classifyGPUMemoryAccounting(memory nvml.Memory_v2, ret nvml.Return) (gpuMemoryAccounting, error) {
+// classifyGPUMemoryAccounting decides how one device's host memory metrics are labelled.
+//
+// v1Available reports whether the independent NVML v1 GetMemoryInfo call produced a
+// usable combined value for this scrape. The mode label describes the value that is
+// actually served: whenever the v1 combined reading exists and the v2 split cannot be
+// trusted, the served metric *is* the v1 combined value, so the mode is v1_combined
+// rather than unknown. unknown is reserved for the case where neither v1 nor v2
+// produced a value.
+//
+// A v2 call that succeeds but reports used < reserved is unusable for a split, yet it
+// is a distinct condition from "v2 does not exist on this host": it means this driver's
+// v2 path is misbehaving. That signal is preserved in v2Anomaly (exported as
+// hami_host_gpu_memory_v2_anomaly) and in the returned error, which the caller logs.
+func classifyGPUMemoryAccounting(memory nvml.Memory_v2, ret nvml.Return, v1Available bool) (gpuMemoryAccounting, error) {
+	// fallback builds the no-split result: v1_combined when a v1 value is being
+	// served, unknown when there is no value from either source.
+	fallback := func(v2Anomaly bool, err error) (gpuMemoryAccounting, error) {
+		mode := gpuMemoryAccountingModeV1Combined
+		if !v1Available {
+			mode = gpuMemoryAccountingModeUnknown
+		}
+		return gpuMemoryAccounting{mode: mode, v2Anomaly: v2Anomaly}, err
+	}
+
 	switch ret {
 	case nvml.SUCCESS:
 		if memory.Used < memory.Reserved {
-			return gpuMemoryAccounting{mode: gpuMemoryAccountingModeUnknown}, fmt.Errorf("nvml v2 memory used is less than reserved")
+			return fallback(true, fmt.Errorf("nvml v2 memory used is less than reserved"))
 		}
 		return gpuMemoryAccounting{
 			mode:      gpuMemoryAccountingModeV2Split,
@@ -288,9 +323,9 @@ func classifyGPUMemoryAccounting(memory nvml.Memory_v2, ret nvml.Return) (gpuMem
 			hasSplit:  true,
 		}, nil
 	case nvml.ERROR_NOT_SUPPORTED, nvml.ERROR_FUNCTION_NOT_FOUND:
-		return gpuMemoryAccounting{mode: gpuMemoryAccountingModeV1Combined}, nil
+		return fallback(false, nil)
 	default:
-		return gpuMemoryAccounting{mode: gpuMemoryAccountingModeUnknown}, fmt.Errorf("nvml get memory v2 error ret=%d", ret)
+		return fallback(false, fmt.Errorf("nvml get memory v2 error ret=%d", ret))
 	}
 }
 
@@ -441,7 +476,10 @@ func (cc ClusterManagerCollector) collectGPUMemoryMetrics(ch chan<- prometheus.M
 	labels := []string{fmt.Sprint(index), uuid, deviceName}
 
 	v2Memory, v2Ret := hdev.GetMemoryInfo_v2()
-	accounting, accountingErr := classifyGPUMemoryAccounting(v2Memory, v2Ret)
+	// The v1 GetMemoryInfo call above succeeded (every other outcome returned early),
+	// so a v1 combined value is always available on this path.
+	const v1Available = true
+	accounting, accountingErr := classifyGPUMemoryAccounting(v2Memory, v2Ret, v1Available)
 	combinedUsed := memory.Used
 	if accounting.hasSplit {
 		// Use the v2 snapshot for all host-memory values so combined, reserved, and
@@ -464,6 +502,17 @@ func (cc ClusterManagerCollector) collectGPUMemoryMetrics(ch chan<- prometheus.M
 		hostGPUMemoryAccountingModeDesc,
 		prometheus.GaugeValue,
 		1,
+		append(labels, string(accounting.mode))...,
+	)
+
+	v2AnomalyValue := 0.0
+	if accounting.v2Anomaly {
+		v2AnomalyValue = 1
+	}
+	ch <- prometheus.MustNewConstMetric(
+		hostGPUMemoryV2AnomalyDesc,
+		prometheus.GaugeValue,
+		v2AnomalyValue,
 		append(labels, string(accounting.mode))...,
 	)
 
